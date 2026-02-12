@@ -14,6 +14,8 @@ In-depth guidance and troubleshooting for each phase of the vps-setup CLI.
 
 ---
 
+**SSH key (Phase A):** Don’t have a key or not sure how to copy it on your laptop? → [ssh-key-help.md](ssh-key-help.md) (macOS, Windows, Linux).
+
 ## Phase guides
 
 | Phase | Topic | Doc |

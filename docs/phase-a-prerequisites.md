@@ -2,6 +2,8 @@
 
 [← Guide index](guide.md)
 
+**Don’t have a key or not sure how to copy it?** See [ssh-key-help.md](ssh-key-help.md) for OS-specific steps (macOS, Windows, Linux).
+
 ## What it does
 
 - Creates a new system user with sudo (or the distro’s admin group: `sudo` on Debian/Ubuntu, `wheel` elsewhere).

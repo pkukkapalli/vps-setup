@@ -14,7 +14,12 @@ import { select, input } from '@inquirer/prompts';
 import chalk from 'chalk';
 import ora from 'ora';
 
-const GUIDE_URL = 'https://github.com/pkukkapalli/vps-setup/blob/main/docs/guide.md';
+const DOCS_BASE = 'https://github.com/pkukkapalli/vps-setup/blob/main/docs';
+const GUIDE_URL = `${DOCS_BASE}/guide.md`;
+const SSH_KEY_HELP_URL = `${DOCS_BASE}/ssh-key-help.md`;
+function docUrl(filename) {
+  return `${DOCS_BASE}/${filename}`;
+}
 
 const info = (msg) => console.log(chalk.cyan('[*]'), msg);
 const ok = (msg) => console.log(chalk.green('[OK]'), msg);
@@ -23,6 +28,17 @@ const err = (msg) => {
   console.error(chalk.red('[ERROR]'), msg);
   process.exit(1);
 };
+
+/** Run a phase only when not already satisfied, unless opts.force. When satisfied and !force: info and return true (caller should return). */
+function shouldSkipPhase(opts, satisfied) {
+  if (!opts || typeof opts !== 'object') return false;
+  if (opts.force) return false;
+  if (satisfied) {
+    info('Already applied. Use --force to re-run.');
+    return true;
+  }
+  return false;
+}
 
 /** True if we need to prefix privileged commands with sudo (running as non-root). */
 let useSudo = false;
@@ -194,26 +210,71 @@ function isValidUsername(s) {
   return /^[a-z_][a-z0-9_.-]*$/i.test(s) && s.length <= 32;
 }
 
-// --- Phase A: Prerequisites ---
-async function phasePrerequisites() {
-  console.log('\n' + chalk.bold('========== Phase A: Prerequisites =========='));
-  console.log('Before firewall or SSH changes:');
-  console.log('  1. Create a non-root user with sudo');
-  console.log('  2. Add your SSH public key to that user\'s ~/.ssh/authorized_keys');
-  console.log('  3. From your laptop: ssh myuser@<vps-ip> and run sudo -v');
-  console.log('  4. Keep this session open and open a second terminal to test after changes.\n');
+function readSshKeyFromOpt(sshKey) {
+  if (!sshKey) return '';
+  const s = String(sshKey).trim();
+  if (s.startsWith('ssh-') || s.startsWith('ecdsa-')) return s;
+  const path = s.replace(/^~/, process.env.HOME || '');
+  try {
+    if (existsSync(path)) return readFileSync(path, 'utf8').trim();
+  } catch {}
+  return s;
+}
 
-  const createUser = await promptYn('Do you want to create a new sudo user now?', 'n');
-  if (createUser !== 'y') {
-    const verified = await promptYn('Have you verified key login and sudo from another terminal?', 's');
-    if (verified !== 'y') warn('Please verify key login before enabling firewall or changing SSH.');
-    return;
+// --- Phase A: Prerequisites ---
+function isPrerequisitesSatisfied(opts) {
+  try {
+    const user = opts && opts.user ? String(opts.user).trim() : null;
+    if (!user) return false;
+    const idResult = spawnSync('id', ['--', user], { encoding: 'utf8', stdio: 'pipe' });
+    if (idResult.status !== 0) return false;
+    const authKeys = `/home/${user}/.ssh/authorized_keys`;
+    const catResult = runRoot(['test', '-f', authKeys], { allowFail: true });
+    if (catResult.status !== 0) return false;
+    const key = opts.sshKey ? readSshKeyFromOpt(opts.sshKey) : null;
+    if (key) {
+      const content = (runRoot(['cat', authKeys], { capture: true }).stdout || '');
+      if (!content.split('\n').some((line) => line.trim() === key.trim())) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function phasePrerequisites(opts) {
+  const agentMode = opts && typeof opts === 'object' && (opts.user != null || opts.sshKey != null);
+  console.log('\n' + chalk.bold('========== Phase A: Prerequisites =========='));
+  if (agentMode && opts.user && shouldSkipPhase(opts, isPrerequisitesSatisfied(opts))) return;
+  if (!agentMode) {
+    console.log('Before firewall or SSH changes:');
+    console.log('  1. Create a non-root user with sudo');
+    console.log('  2. Add your SSH public key to that user\'s ~/.ssh/authorized_keys');
+    console.log('  3. From your laptop: ssh myuser@<vps-ip> and run sudo -v');
+    console.log('  4. Keep this session open and open a second terminal to test after changes.\n');
   }
 
-  const newuser = (await input({ message: 'Username for new admin user', default: '' })).trim();
-  if (!newuser) {
-    warn('Skipping user creation.');
-    return;
+  let newuser;
+  if (agentMode && opts.user) {
+    newuser = String(opts.user).trim();
+    if (!newuser) {
+      warn('Phase prerequisites: --user is required in agent mode.');
+      return;
+    }
+  } else {
+    const createUser = await promptYn('Do you want to create a new sudo user now?', 'n');
+    if (createUser !== 'y') {
+      const verified = await promptYn('Have you verified key login and sudo from another terminal?', 's');
+      if (verified !== 'y') warn('Please verify key login before enabling firewall or changing SSH.');
+      info(`Manual steps: ${docUrl('phase-a-prerequisites.md')}`);
+      return;
+    }
+    newuser = (await input({ message: 'Username for new admin user', default: '' })).trim();
+    if (!newuser) {
+      warn('Skipping user creation.');
+      info(`To create a user and add keys manually: ${docUrl('phase-a-prerequisites.md')}`);
+      return;
+    }
   }
   if (!isValidUsername(newuser)) {
     err('Invalid username: use only letters, numbers, underscore, hyphen, period (e.g. deploy, my_admin).');
@@ -240,7 +301,28 @@ async function phasePrerequisites() {
   runRoot(['chmod', '700', sshDir]);
   runRoot(['chown', `${newuser}:${newuser}`, sshDir]);
 
-  const pubkey = (await input({ message: 'Paste your SSH public key (one line), then Enter', default: '' })).trim();
+  let pubkey;
+  if (agentMode) {
+    pubkey = readSshKeyFromOpt(opts.sshKey);
+  } else {
+  const hostOs = await select({
+    message: 'What OS is your laptop / the machine you’ll SSH from?',
+    choices: [
+      { name: 'macOS', value: 'macos' },
+      { name: 'Windows', value: 'windows' },
+      { name: 'Linux', value: 'linux' },
+    ],
+  });
+
+    const sshKeyHints = {
+      macos: 'On your Mac: run  pbcopy < ~/.ssh/id_ed25519.pub  (or id_rsa.pub) then paste here.',
+      windows: 'On Windows: PowerShell  Get-Content $env:USERPROFILE\\.ssh\\id_ed25519.pub | Set-Clipboard  then paste. Or open the .pub file in Notepad and copy the line.',
+      linux: 'On your machine: run  cat ~/.ssh/id_ed25519.pub  (or id_rsa.pub), copy the full line and paste here.',
+    };
+    console.log(chalk.cyan('\n  ' + sshKeyHints[hostOs]) + '\n');
+    pubkey = (await input({ message: 'Paste your SSH public key (one line), then Enter', default: '' })).trim();
+  }
+
   if (pubkey) {
     const authKeys = `${sshDir}/authorized_keys`;
     // Append key using a temp file + cat >> (tee would echo to stdout)
@@ -259,19 +341,48 @@ async function phasePrerequisites() {
     runRoot(['chmod', '600', authKeys]);
     ok(`Key added. Test with: ssh ${newuser}@<this-server-ip>`);
   } else {
-    warn(`Add it manually to ${sshDir}/authorized_keys`);
+    if (!agentMode) {
+      warn(`No key entered. To create or find your key and copy it, see: ${SSH_KEY_HELP_URL}`);
+      warn(`Or add it manually later to ${sshDir}/authorized_keys`);
+    }
   }
 
-  const verified = await promptYn('Have you verified key login and sudo from another terminal?', 's');
-  if (verified !== 'y') warn('Please verify key login before enabling firewall or changing SSH.');
+  if (!agentMode) {
+    const verified = await promptYn('Have you verified key login and sudo from another terminal?', 's');
+    if (verified !== 'y') warn('Please verify key login before enabling firewall or changing SSH.');
+  }
 }
 
 // --- Phase B: Firewall ---
-async function phaseFirewall() {
-  console.log('\n' + chalk.bold('========== Phase B: Firewall (UFW) =========='));
-  console.log('Will: install ufw, set default deny incoming, allow 22/80/443, deny 3000/8080, enable.\n');
+function isFirewallSatisfied(opts) {
+  try {
+    const r = runRoot(['ufw', 'status'], { capture: true, allowFail: true });
+    if (r.status !== 0 || !(r.stdout || '').toLowerCase().includes('status: active')) return false;
+    const allowPorts = (opts && opts.allow ? String(opts.allow) : '22,80,443').split(',').map((p) => p.trim()).filter(Boolean);
+    const out = (r.stdout || '');
+    for (const p of allowPorts) {
+      const suffix = p.includes('/') ? p : `${p}/tcp`;
+      if (!out.includes(suffix)) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-  if ((await promptYn('Configure UFW?', 'y')) !== 'y') return;
+async function phaseFirewall(opts) {
+  const agentMode = opts && typeof opts === 'object';
+  console.log('\n' + chalk.bold('========== Phase B: Firewall (UFW) =========='));
+  if (shouldSkipPhase(opts, isFirewallSatisfied(opts))) return;
+  if (!agentMode) {
+    console.log('Will: install ufw, set default deny incoming, allow 22/80/443, deny 3000/8080, enable.\n');
+    console.log(chalk.dim('  Tip: If you get locked out after enabling UFW, use your provider\'s recovery console and run: sudo ufw allow 22/tcp\n'));
+  }
+
+  if (!agentMode && (await promptYn('Configure UFW?', 'y')) !== 'y') {
+    info(`Manual steps and lockout recovery: ${docUrl('phase-b-firewall.md')}`);
+    return;
+  }
 
   const { pkgManager } = getDistro();
   const ufwPkgs = (PACKAGES[pkgManager] && PACKAGES[pkgManager].ufw) || ['ufw'];
@@ -288,15 +399,23 @@ async function phaseFirewall() {
   runRoot(['ufw', 'default', 'deny', 'incoming']);
   runRoot(['ufw', 'default', 'allow', 'outgoing']);
   runRoot(['ufw', 'default', 'deny', 'forward']);
-  runRoot(['ufw', 'allow', '22/tcp']);
-  runRoot(['ufw', 'allow', '80/tcp']);
-  runRoot(['ufw', 'allow', '443/tcp']);
-  runRoot(['ufw', 'deny', '3000']);
-  runRoot(['ufw', 'deny', '8080']);
 
-  const extra = (await input({ message: 'Extra ports to DENY (space-separated, or Enter to skip', default: '' })).trim();
-  for (const p of extra.split(/\s+/)) {
-    if (/^\d+$/.test(p)) runRoot(['ufw', 'deny', p]);
+  const allowPorts = agentMode ? String(opts.allow || '22,80,443').split(',') : ['22', '80', '443'];
+  for (const p of allowPorts) {
+    const port = p.trim();
+    if (port) runRoot(['ufw', 'allow', port.includes('/') ? port : port + '/tcp']);
+  }
+  const denyPorts = agentMode ? String(opts.deny || '3000,8080').split(',') : ['3000', '8080'];
+  for (const p of denyPorts) {
+    const port = p.trim();
+    if (/^\d+$/.test(port)) runRoot(['ufw', 'deny', port]);
+  }
+
+  if (!agentMode) {
+    const extra = (await input({ message: 'Extra ports to DENY (space-separated, or Enter to skip', default: '' })).trim();
+    for (const p of extra.split(/\s+/)) {
+      if (/^\d+$/.test(p)) runRoot(['ufw', 'deny', p]);
+    }
   }
 
   const ufwDefault = '/etc/default/ufw';
@@ -311,27 +430,65 @@ async function phaseFirewall() {
   console.log('');
   runRoot(['ufw', 'show', 'added']);
 
-  const enable = await promptYn('Enable UFW now? (SSH must be allowed or you may lock out)', 'y');
-  if (enable === 'y') {
+  const doEnable = agentMode ? opts.enable === true : (await promptYn('Enable UFW now? (SSH must be allowed or you may lock out)', 'y')) === 'y';
+  if (doEnable) {
     runRoot(['ufw', '--force', 'enable']);
     ok('UFW enabled.');
   } else {
-    warn('UFW not enabled. Run: sudo ufw enable');
+    if (!agentMode) {
+      warn('UFW not enabled. Run: sudo ufw enable');
+      info(`Recovery and manual steps: ${docUrl('phase-b-firewall.md')}`);
+    }
   }
 }
 
 // --- Phase C: Updates ---
-async function phaseUpdates() {
+function isUpdatesSatisfied() {
+  try {
+    const { pkgManager } = getDistro();
+    if (pkgManager === 'apt') {
+      const path = '/etc/apt/apt.conf.d/20auto-upgrades';
+      const r = runRoot(['test', '-f', path], { allowFail: true });
+      if (r.status !== 0) return false;
+      const content = (runRoot(['cat', path], { capture: true }).stdout || '');
+      return content.includes('Unattended-Upgrade "1"') || content.includes('Unattended-Upgrade "1";');
+    }
+    if (pkgManager === 'dnf') {
+      const r = runRoot(['systemctl', 'is-enabled', 'dnf-automatic-install.timer'], { capture: true, allowFail: true });
+      return r.status === 0 && (r.stdout || '').trim() === 'enabled';
+    }
+    if (pkgManager === 'yum') {
+      const r = runRoot(['systemctl', 'is-enabled', 'yum-cron'], { capture: true, allowFail: true });
+      return r.status === 0 && (r.stdout || '').trim() === 'enabled';
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function phaseUpdates(opts) {
   console.log('\n' + chalk.bold('========== Phase C: Automatic security updates =========='));
   const { pkgManager } = getDistro();
   const updatePkgs = (PACKAGES[pkgManager] && PACKAGES[pkgManager].updates) || [];
-
+  const agentMode = opts && typeof opts === 'object';
+  if (shouldSkipPhase(opts, isUpdatesSatisfied())) return;
   if (updatePkgs.length === 0) {
     warn('Automatic security updates are not configured for this distro. Configure manually if desired.');
+    info(`Per-distro notes: ${docUrl('phase-c-updates.md')}`);
     return;
   }
-  console.log('Will: install and enable automatic security updates (no auto-reboot).\n');
-  if ((await promptYn('Configure automatic updates?', 'y')) !== 'y') return;
+  if (!agentMode) {
+    console.log('Will: install and enable automatic security updates (no auto-reboot).\n');
+    const pm = getDistro().pkgManager;
+    console.log(chalk.dim(`  This distro uses: ${pm === 'apt' ? 'unattended-upgrades' : pm === 'dnf' ? 'dnf-automatic' : 'yum-cron'}\n`));
+    if ((await promptYn('Configure automatic updates?', 'y')) !== 'y') {
+      info(`Manual steps: ${docUrl('phase-c-updates.md')}`);
+      return;
+    }
+  } else if (!opts.enable) {
+    return;
+  }
 
   const spinner = ora('Installing and configuring...').start();
   try {
@@ -354,74 +511,85 @@ async function phaseUpdates() {
     spinner.succeed('Automatic updates configured.');
   } catch (e) {
     spinner.fail('Failed.');
+    warn(`Troubleshooting: ${docUrl('phase-c-updates.md')}`);
     throw e;
   }
   ok('Security updates will run automatically (daily/timer).');
 }
 
 // --- Phase D: SSH ---
-async function phaseSsh() {
-  console.log('\n' + chalk.bold('========== Phase D: SSH hardening =========='));
-
-  // Loud mandatory warning: do not proceed without key-only login verified
-  console.log(chalk.red.bold('\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'));
-  console.log(chalk.red.bold('!!!  WARNING: YOU CAN BE LOCKED OUT OF THIS SERVER  !!!'));
-  console.log(chalk.red.bold('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n'));
-  console.log(chalk.red('SSH hardening will disable password login and/or root login.'));
-  console.log(chalk.red('If your SSH key login is not working, you will NOT be able to log in again.\n'));
-  console.log(chalk.yellow.bold('You MUST do this first, in a SEPARATE terminal (keep this one open):'));
-  console.log(chalk.yellow('  1. Open a new terminal on your laptop.'));
-  console.log(chalk.yellow('  2. Log in with: ssh <your-user>@<this-server-ip>'));
-  console.log(chalk.yellow('  3. Confirm you get in using ONLY your SSH key (no password prompt).'));
-  console.log(chalk.yellow('  4. Run "sudo -v" to confirm sudo works.'));
-  console.log(chalk.yellow('  5. Leave that session open, then return here.\n'));
-  console.log(chalk.red.bold('Only answer Yes below if you have done the above. Otherwise answer No and test first.\n'));
-
-  const verified = await select({
-    message: 'Have you verified key-only login from another terminal?',
-    choices: [
-      { name: 'Yes — I have logged in with my key only and I am sure', value: 'y' },
-      { name: 'No / Skip — I have not verified yet (SSH hardening will be skipped)', value: 'n' },
-    ],
-  });
-
-  if (verified !== 'y') {
-    warn('SSH hardening skipped. Verify key-only login, then run this phase again.');
-    return;
+function isSshSatisfied() {
+  try {
+    const r = runRoot(['test', '-f', '/etc/ssh/sshd_config.d/99-vps-setup.conf'], { allowFail: true });
+    return r.status === 0;
+  } catch {
+    return false;
   }
+}
 
-  console.log('\nOptions:');
-  console.log('  - Match: KbdInteractiveAuthentication no, PermitRootLogin prohibit-password');
-  console.log('  - Harden: PasswordAuthentication no, MaxAuthTries 3, X11 off, AllowUsers\n');
+async function phaseSsh(opts) {
+  const agentMode = opts && typeof opts === 'object';
+  console.log('\n' + chalk.bold('========== Phase D: SSH hardening =========='));
+  if (shouldSkipPhase(opts, isSshSatisfied())) return;
 
-  if ((await promptYn('Configure SSH drop-in?', 'y')) !== 'y') return;
+  if (!agentMode) {
+    console.log(chalk.red.bold('\n!!!  WARNING: YOU CAN BE LOCKED OUT OF THIS SERVER  !!!\n'));
+    console.log(chalk.red('SSH hardening will disable password login and/or root login.'));
+    console.log(chalk.yellow('Verify key-only login in a SEPARATE terminal first.\n'));
+    const verified = await select({
+      message: 'Have you verified key-only login from another terminal?',
+      choices: [
+        { name: 'Yes — I have logged in with my key only and I am sure', value: 'y' },
+        { name: 'No / Skip', value: 'n' },
+      ],
+    });
+    if (verified !== 'y') {
+      warn('SSH hardening skipped.');
+      info(`Manual config and lockout recovery: ${docUrl('phase-d-ssh.md')}`);
+      return;
+    }
+    console.log('\nOptions: Match (safe) or Harden (key-only, AllowUsers)\n');
+    if ((await promptYn('Configure SSH drop-in?', 'y')) !== 'y') {
+      info(`Manual SSH hardening: ${docUrl('phase-d-ssh.md')}`);
+      return;
+    }
+  }
 
   const sshdD = '/etc/ssh/sshd_config.d';
   runRoot(['mkdir', '-p', sshdD]);
   const dropin = `${sshdD}/99-vps-setup.conf`;
 
-  const choice = await select({
-    message: 'Hardening level',
-    default: '1',
-    choices: [
-      { name: 'Match only (safe)', value: '1' },
-      { name: 'Harden (key-only, no root, MaxAuthTries 3, X11 off, AllowUsers)', value: '2' },
-    ],
-  });
+  const choice = agentMode
+    ? (String(opts.level || 'match').toLowerCase() === 'harden' ? '2' : '1')
+    : (await select({
+        message: 'Hardening level',
+        default: '1',
+        choices: [
+          { name: 'Match only (safe)', value: '1' },
+          { name: 'Harden (key-only, no root, MaxAuthTries 3, X11 off, AllowUsers)', value: '2' },
+        ],
+      }));
 
   let allowUsers = '';
   if (choice === '2') {
-    const current = process.env.SUDO_USER || process.env.USER || 'root';
-    const raw = (await input({
-      message: 'AllowUsers: comma-separated list, or Enter for current user only',
-      default: current,
-    })).trim();
-    if (raw) {
+    if (agentMode) {
+      const raw = String(opts.allowUsers || process.env.SUDO_USER || process.env.USER || 'root').trim();
       const names = raw.split(/[\s,]+/).filter(Boolean).filter(isValidUsername);
-      if (names.length === 0) err('No valid usernames. Use only letters, numbers, underscore, hyphen, period.');
+      if (names.length === 0) err('Phase ssh: --allow-users required when --level=harden (comma-separated usernames).');
       allowUsers = names.join(' ');
     } else {
-      allowUsers = isValidUsername(current) ? current : 'root';
+      const current = process.env.SUDO_USER || process.env.USER || 'root';
+      const raw = (await input({
+        message: 'AllowUsers: comma-separated list, or Enter for current user only',
+        default: current,
+      })).trim();
+      if (raw) {
+        const names = raw.split(/[\s,]+/).filter(Boolean).filter(isValidUsername);
+        if (names.length === 0) err('No valid usernames.');
+        allowUsers = names.join(' ');
+      } else {
+        allowUsers = isValidUsername(current) ? current : 'root';
+      }
     }
   }
 
@@ -445,9 +613,10 @@ PermitRootLogin prohibit-password
   ok(`Wrote ${dropin}`);
 
   warn('Restart SSH after testing in a NEW terminal: sudo systemctl restart sshd || sudo systemctl restart ssh');
+  if (!agentMode) console.log(chalk.dim(`  If you get locked out: ${docUrl('phase-d-ssh.md')}\n`));
 
-  const restart = await promptYn('Restart SSH now? (only if you have another session open)', 'n');
-  if (restart === 'y') {
+  const doRestart = agentMode ? opts.restart === true : (await promptYn('Restart SSH now? (only if you have another session open)', 'n')) === 'y';
+  if (doRestart) {
     try {
       runRoot(['systemctl', 'restart', 'sshd']);
     } catch {
@@ -458,17 +627,37 @@ PermitRootLogin prohibit-password
 }
 
 // --- Phase E: Sudo ---
-async function phaseSudo() {
+function isSudoSatisfied() {
+  try {
+    const cloudSudo = '/etc/sudoers.d/90-cloud-init-users';
+    const r = runRoot(['test', '-f', cloudSudo], { allowFail: true });
+    if (r.status !== 0) return true; // no file = nothing to fix
+    const catResult = runRoot(['cat', cloudSudo], { capture: true, allowFail: true });
+    if (catResult.status !== 0) return false;
+    const content = catResult.stdout || '';
+    const hasNopasswd = /^\s*root\s+ALL=.*NOPASSWD/m.test(content);
+    return !hasNopasswd; // satisfied when no uncommented NOPASSWD
+  } catch {
+    return false;
+  }
+}
+
+async function phaseSudo(opts) {
+  const agentMode = opts && typeof opts === 'object' && opts.removeNopasswd === true;
   console.log('\n' + chalk.bold('========== Phase E: Sudo / cloud-init =========='));
+  if (shouldSkipPhase(opts, isSudoSatisfied())) return;
+  if (!agentMode) console.log(chalk.dim('  Only applies to cloud images that add a root NOPASSWD rule (e.g. 90-cloud-init-users).\n'));
   const cloudSudo = '/etc/sudoers.d/90-cloud-init-users';
-  if (!existsSync(cloudSudo)) {
+  const existsCheck = runRoot(['test', '-f', cloudSudo], { allowFail: true });
+  if (existsCheck.status !== 0) {
     info('No cloud-init sudoers file found. Nothing to change.');
+    info(`Manual sudoers editing: ${docUrl('phase-e-sudo.md')}`);
     return;
   }
-  // sudoers files are typically mode 0440 — must read as root
   const catResult = runRoot(['cat', cloudSudo], { capture: true, allowFail: true });
   if (catResult.status !== 0) {
     warn(`Cannot read ${cloudSudo}. Skipping.`);
+    info(`Use visudo and see: ${docUrl('phase-e-sudo.md')}`);
     return;
   }
   const content = catResult.stdout || '';
@@ -476,13 +665,19 @@ async function phaseSudo() {
     info('No root NOPASSWD in file. Nothing to change.');
     return;
   }
-  console.log(`Found root NOPASSWD in ${cloudSudo} (weakens audit).`);
-  if ((await promptYn('Remove or comment out root NOPASSWD?', 'n')) !== 'y') return;
+  if (!agentMode) {
+    console.log(`Found root NOPASSWD in ${cloudSudo} (weakens audit).`);
+    if ((await promptYn('Remove or comment out root NOPASSWD?', 'n')) !== 'y') {
+      info(`Manual steps and recovery: ${docUrl('phase-e-sudo.md')}`);
+      return;
+    }
+  }
 
   const newContent = content.replace(/^(\s*root\s+ALL=.*NOPASSWD.*)$/gm, '# $1');
   writeFileRoot(cloudSudo + '.bak', content);
   writeFileRoot(cloudSudo, newContent);
   ok('Commented out. Restored from ' + cloudSudo + '.bak if needed.');
+  info(`Recovery if sudo breaks: ${docUrl('phase-e-sudo.md')}`);
 }
 
 // --- Phase F: Nginx (custom domain + optional load balancing) ---
@@ -512,56 +707,86 @@ function parseBackends(raw) {
   return out;
 }
 
-async function phaseNginx() {
-  console.log('\n' + chalk.bold('========== Phase F: Nginx + custom domain + TLS =========='));
-  console.log('Will: install Nginx + Certbot, set up a server block for your domain,');
-  console.log('      optionally reverse-proxy / load-balance to backend servers, then obtain Let\'s Encrypt cert.\n');
+function isNginxSatisfied(opts) {
+  if (!opts || !opts.domain || !isValidDomain(String(opts.domain).trim())) return false;
+  try {
+    const primaryDomain = String(opts.domain).trim();
+    const safeName = primaryDomain.replace(/[^a-z0-9.-]/gi, '_');
+    const confPath = `/etc/nginx/conf.d/vps-setup-${safeName}.conf`;
+    const r = runRoot(['test', '-f', confPath], { allowFail: true });
+    return r.status === 0;
+  } catch {
+    return false;
+  }
+}
 
-  if ((await promptYn('Install Nginx and Certbot?', 'n')) !== 'y') return;
+async function phaseNginx(opts) {
+  const agentMode = opts && typeof opts === 'object' && opts.domain;
+  console.log('\n' + chalk.bold('========== Phase F: Nginx + custom domain + TLS =========='));
+  if (agentMode && shouldSkipPhase(opts, isNginxSatisfied(opts))) return;
+  if (!agentMode) {
+    console.log('Will: install Nginx + Certbot, set up a server block for your domain,');
+    console.log('      optionally reverse-proxy / load-balance to backend servers, then obtain Let\'s Encrypt cert.\n');
+    if ((await promptYn('Install Nginx and Certbot?', 'n')) !== 'y') {
+      info(`Manual Nginx + TLS: ${docUrl('phase-f-nginx.md')}`);
+      return;
+    }
+  }
 
   const { pkgManager } = getDistro();
   const nginxPkgs = (PACKAGES[pkgManager] && PACKAGES[pkgManager].nginx) || ['nginx', 'certbot'];
   pkgUpdate();
   pkgInstall(nginxPkgs);
 
-  const domainInput = (await input({
-    message: 'Primary domain (e.g. example.com)',
-    default: '',
-  })).trim();
-  if (!domainInput) {
-    warn('No domain. Run later: certbot --nginx -d yourdomain.com');
-    return;
-  }
-  if (!isValidDomain(domainInput)) {
-    warn(`"${domainInput}" doesn't look like a valid domain. Skipping Nginx config.`);
-    return;
-  }
-
-  const extraDomains = (await input({
-    message: 'Extra domains for same cert, comma-separated (e.g. www.example.com), or Enter to skip',
-    default: '',
-  })).trim();
-  const extraList = extraDomains.split(',').map((d) => d.trim()).filter(Boolean);
-  const invalidExtras = extraList.filter((d) => !isValidDomain(d));
-  if (invalidExtras.length > 0) {
-    warn(`Ignoring invalid domain(s): ${invalidExtras.join(', ')}`);
-  }
-  const domainList = [domainInput, ...extraList.filter(isValidDomain)];
-  const primaryDomain = domainList[0];
-  const serverNames = domainList.join(' ');
-
-  const useProxy = await promptYn('Reverse-proxy / load balance to backend servers on this VPS?', 'n');
-  let backends = [];
-  if (useProxy === 'y') {
-    const backendInput = (await input({
-      message: 'Backend addresses (host:port), space or comma separated (e.g. 127.0.0.1:3000 127.0.0.1:3001 or :8080 for localhost)',
-      default: '127.0.0.1:3000',
+  let domainInput, extraList, backends;
+  if (agentMode) {
+    domainInput = String(opts.domain || '').trim();
+    if (!domainInput || !isValidDomain(domainInput)) {
+      err('Phase nginx: --domain <primary-domain> is required and must be a valid domain.');
+    }
+    const extraRaw = String(opts.extraDomains || '').trim();
+    extraList = extraRaw ? extraRaw.split(',').map((d) => d.trim()).filter(Boolean).filter(isValidDomain) : [];
+    const backendRaw = String(opts.backends || '').trim();
+    backends = backendRaw ? parseBackends(backendRaw) : [];
+  } else {
+    console.log(chalk.cyan('\n  Ensure your domain\'s DNS A record points to this server\'s IP before Certbot runs.\n'));
+    domainInput = (await input({
+      message: 'Primary domain (e.g. example.com)',
+      default: '',
     })).trim();
-    backends = parseBackends(backendInput);
-    if (backends.length === 0) {
-      warn('No valid backends. Using simple placeholder server block.');
+    if (!domainInput) {
+      warn('No domain. Run later: certbot --nginx -d yourdomain.com');
+      info(`Full steps: ${docUrl('phase-f-nginx.md')}`);
+      return;
+    }
+    if (!isValidDomain(domainInput)) {
+      warn(`"${domainInput}" doesn't look like a valid domain. Skipping Nginx config.`);
+      info(`Domain format and manual setup: ${docUrl('phase-f-nginx.md')}`);
+      return;
+    }
+    const extraDomains = (await input({
+      message: 'Extra domains for same cert, comma-separated (e.g. www.example.com), or Enter to skip',
+      default: '',
+    })).trim();
+    extraList = extraDomains.split(',').map((d) => d.trim()).filter(Boolean);
+    const invalidExtras = extraList.filter((d) => !isValidDomain(d));
+    if (invalidExtras.length > 0) warn(`Ignoring invalid domain(s): ${invalidExtras.join(', ')}`);
+    extraList = extraList.filter(isValidDomain);
+    const useProxy = await promptYn('Reverse-proxy / load balance to backend servers on this VPS?', 'n');
+    backends = [];
+    if (useProxy === 'y') {
+      const backendInput = (await input({
+        message: 'Backend addresses (host:port), space or comma separated (e.g. 127.0.0.1:3000 127.0.0.1:3001 or :8080 for localhost)',
+        default: '127.0.0.1:3000',
+      })).trim();
+      backends = parseBackends(backendInput);
+      if (backends.length === 0) warn('No valid backends. Using simple placeholder server block.');
     }
   }
+
+  const domainList = [domainInput, ...extraList];
+  const primaryDomain = domainList[0];
+  const serverNames = domainList.join(' ');
 
   runRoot(['systemctl', 'enable', 'nginx'], { allowFail: true });
   runRoot(['systemctl', 'start', 'nginx'], { allowFail: true });
@@ -620,31 +845,54 @@ ${serverBlock.trim()}
   if (testResult.status !== 0) {
     warn(`Nginx config test failed: ${(testResult.stderr || testResult.stdout || '').trim()}`);
     warn(`Fix the config at ${confPath} and run: sudo nginx -t && sudo systemctl reload nginx`);
+    info(`Troubleshooting: ${docUrl('phase-f-nginx.md')}`);
     return;
   }
   runRoot(['systemctl', 'reload', 'nginx']);
   ok('Nginx reloaded.');
 
-  const certDomains = domainList.flatMap((d) => ['-d', d]);
-  const result = runRoot(
-    ['certbot', '--nginx', '--non-interactive', '--agree-tos', '--register-unsafely-without-email', ...certDomains],
-    { allowFail: true }
-  );
-  if (result.status === 0) {
-    ok('TLS certificate obtained.');
-    if (backends.length > 0) info(`HTTPS traffic to ${primaryDomain} is load-balanced across ${backends.length} backend(s).`);
-  } else {
-    warn('Certbot failed (e.g. DNS not pointing here). Run manually: sudo certbot --nginx -d ' + primaryDomain);
+  const runCertbot = agentMode ? opts.certbot !== false : true;
+  if (runCertbot) {
+    const certDomains = domainList.flatMap((d) => ['-d', d]);
+    const result = runRoot(
+      ['certbot', '--nginx', '--non-interactive', '--agree-tos', '--register-unsafely-without-email', ...certDomains],
+      { allowFail: true }
+    );
+    if (result.status === 0) {
+      ok('TLS certificate obtained.');
+      if (backends.length > 0) info(`HTTPS traffic to ${primaryDomain} is load-balanced across ${backends.length} backend(s).`);
+    } else {
+      warn('Certbot failed (e.g. DNS not pointing here). Run manually: sudo certbot --nginx -d ' + primaryDomain);
+      info(`Certbot and DNS troubleshooting: ${docUrl('phase-f-nginx.md')}`);
+    }
   }
-  console.log('You can add security headers in the server block (e.g. add_header X-Frame-Options SAMEORIGIN;).');
+  if (!agentMode) console.log('You can add security headers in the server block (e.g. add_header X-Frame-Options SAMEORIGIN;).');
 }
 
 // --- Phase G: Fail2ban ---
-async function phaseFail2ban() {
-  console.log('\n' + chalk.bold('========== Phase G: Fail2ban =========='));
-  console.log('Will: install fail2ban, enable sshd jail.\n');
+function isFail2banSatisfied() {
+  try {
+    const r = runRoot(['systemctl', 'is-active', 'fail2ban'], { capture: true, allowFail: true });
+    return r.status === 0 && (r.stdout || '').trim() === 'active';
+  } catch {
+    return false;
+  }
+}
 
-  if ((await promptYn('Install and enable fail2ban (sshd jail)?', 'n')) !== 'y') return;
+async function phaseFail2ban(opts) {
+  const agentMode = opts && typeof opts === 'object';
+  console.log('\n' + chalk.bold('========== Phase G: Fail2ban =========='));
+  if (shouldSkipPhase(opts, isFail2banSatisfied())) return;
+  if (!agentMode) {
+    console.log('Will: install fail2ban, enable sshd jail.\n');
+    console.log(chalk.dim('  If fail2ban bans your IP, unban from another machine or provider console: sudo fail2ban-client set sshd unbanip <your-ip>\n'));
+    if ((await promptYn('Install and enable fail2ban (sshd jail)?', 'n')) !== 'y') {
+      info(`Manual setup and unban: ${docUrl('phase-g-fail2ban.md')}`);
+      return;
+    }
+  } else if (!opts.enable) {
+    return;
+  }
 
   const { pkgManager } = getDistro();
   const f2bPkgs = (PACKAGES[pkgManager] && PACKAGES[pkgManager].fail2ban) || ['fail2ban'];
@@ -657,31 +905,89 @@ async function phaseFail2ban() {
     spinner.succeed('Fail2ban enabled. Check: sudo fail2ban-client status sshd');
   } catch (e) {
     spinner.fail('Failed.');
+    warn(`Troubleshooting: ${docUrl('phase-g-fail2ban.md')}`);
     throw e;
   }
 }
 
 // --- UFW logging ---
-async function phaseUfwLogging() {
-  console.log('\n' + chalk.bold('========== UFW logging =========='));
+function isUfwLoggingSatisfied(opts) {
   try {
+    const level = (opts && opts.level ? String(opts.level) : 'medium').toLowerCase();
     const r = runRoot(['ufw', 'status', 'verbose'], { capture: true, allowFail: true });
+    if (r.status !== 0) return false;
     const line = (r.stdout || '').split('\n').find((l) => l.toLowerCase().includes('logging'));
-    if (line) console.log(line);
-  } catch {}
-  if ((await promptYn("Set UFW logging to 'medium' for better visibility?", 'n')) === 'y') {
-    runRoot(['ufw', 'logging', 'medium']);
-    ok('UFW logging set to medium.');
+    if (!line) return false;
+    return line.toLowerCase().includes(level);
+  } catch {
+    return false;
   }
 }
 
-// --- Phase M: Mosh ---
-async function phaseMosh() {
-  console.log('\n' + chalk.bold('========== Phase M: Mosh (mobile shell) =========='));
-  console.log('Will: install mosh server, allow UDP 60000:61000 in UFW (mosh port range).\n');
-  console.log('Connect from your laptop with: mosh user@<server-ip>\n');
+async function phaseUfwLogging(opts) {
+  const agentMode = opts && typeof opts === 'object' && opts.level;
+  console.log('\n' + chalk.bold('========== UFW logging =========='));
+  if (shouldSkipPhase(opts, isUfwLoggingSatisfied(opts))) return;
+  if (!agentMode) {
+    try {
+      const r = runRoot(['ufw', 'status', 'verbose'], { capture: true, allowFail: true });
+      const line = (r.stdout || '').split('\n').find((l) => l.toLowerCase().includes('logging'));
+      if (line) console.log(line);
+    } catch {}
+    if ((await promptYn("Set UFW logging to 'medium' for better visibility?", 'n')) === 'y') {
+      runRoot(['ufw', 'logging', 'medium']);
+      ok('UFW logging set to medium.');
+    } else {
+      info(`Manual: ${docUrl('phase-h-ufw-logging.md')}`);
+    }
+    return;
+  }
+  const level = String(opts.level).toLowerCase();
+  if (!['off', 'low', 'medium', 'high', 'full'].includes(level)) {
+    err('Phase ufw-logging: --level must be one of: off, low, medium, high, full');
+  }
+  runRoot(['ufw', 'logging', level]);
+  ok(`UFW logging set to ${level}.`);
+}
 
-  if ((await promptYn('Install Mosh and open firewall?', 'y')) !== 'y') return;
+// --- Phase M: Mosh ---
+function isMoshSatisfied() {
+  try {
+    const which = spawnSync('which', ['mosh-server'], { encoding: 'utf8', stdio: 'pipe' });
+    if (which.status !== 0) return false;
+    const r = runRoot(['ufw', 'status'], { capture: true, allowFail: true });
+    return r.status === 0 && (r.stdout || '').includes('60000:61000');
+  } catch {
+    return false;
+  }
+}
+
+async function phaseMosh(opts) {
+  const agentMode = opts && typeof opts === 'object' && opts.enable === true;
+  console.log('\n' + chalk.bold('========== Phase M: Mosh (mobile shell) =========='));
+  if (shouldSkipPhase(opts, isMoshSatisfied())) return;
+  if (!agentMode) {
+    console.log('Will: install mosh server, allow UDP 60000:61000 in UFW (mosh port range).\n');
+    const moshClientHints = {
+      macos: 'On your Mac install client: brew install mosh',
+      windows: 'On Windows: install Mosh from Microsoft Store, or use WSL and run: sudo apt install mosh',
+      linux: 'On your laptop: sudo apt install mosh  (or dnf/pacman/zypper)',
+    };
+    const clientOs = await select({
+      message: 'What OS is the machine you\'ll connect from? (for client install hint)',
+      choices: [
+        { name: 'macOS', value: 'macos' },
+        { name: 'Windows', value: 'windows' },
+        { name: 'Linux', value: 'linux' },
+      ],
+    });
+    console.log(chalk.cyan('\n  ' + moshClientHints[clientOs]) + '\n');
+    console.log('Connect: mosh <user>@<this-server-ip>\n');
+    if ((await promptYn('Install Mosh and open firewall?', 'y')) !== 'y') {
+      info(`Manual setup: ${docUrl('phase-m-mosh.md')}`);
+      return;
+    }
+  }
 
   const { pkgManager } = getDistro();
   const moshPkgs = (PACKAGES[pkgManager] && PACKAGES[pkgManager].mosh) || ['mosh'];
@@ -702,6 +1008,7 @@ async function phaseMosh() {
     ok('UFW: allowed UDP 60000:61000 (mosh).');
   } else {
     warn('UFW is not active. After enabling UFW, run: sudo ufw allow 60000:61000/udp');
+    info(`Full steps: ${docUrl('phase-m-mosh.md')}`);
   }
   ok('Connect with: mosh <user>@<this-server-ip>');
 }
@@ -758,12 +1065,30 @@ async function main() {
   console.log(chalk.dim('  For in-depth details and troubleshooting: ' + GUIDE_URL + '\n'));
 
   const program = new Command();
-  program.name('vps-setup').description('Interactive VPS security setup (UFW, SSH, updates, Nginx, fail2ban)');
+  program
+    .name('vps-setup')
+    .description('VPS security setup: firewall, SSH, updates, Nginx, fail2ban. Interactive (run) or agent-friendly (phase <name> [options]).')
+    .addHelpText('after', `
+AGENT / AUTOMATION USE (non-interactive, no prompts):
+  Run a single phase by name with flags. Required and optional options vary by phase.
+  Get per-phase help:  vps-setup phase <name> --help
+  Phases skip if already applied; use --force to re-run.
+
+  Phases: prerequisites | firewall | updates | ssh | sudo | nginx | fail2ban | ufw-logging | mosh
+
+  Examples:
+    vps-setup phase prerequisites --user deploy --ssh-key "$(cat ~/.ssh/id_ed25519.pub)"
+    vps-setup phase firewall --allow 22,80,443 --deny 3000,8080 --enable
+    vps-setup phase updates --enable
+    vps-setup phase nginx --domain example.com --backends 127.0.0.1:3000 --certbot
+    vps-setup phase fail2ban --enable
+    vps-setup phase mosh --enable
+`);
 
   program
     .command('run', { isDefault: true })
-    .description('Run interactive menu (or use --all to run all phases with prompts)')
-    .option('--all', 'Run all phases in sequence with prompts')
+    .description('Interactive menu (prompts). Use --all to run every phase with prompts.')
+    .option('--all', 'Run all phases in sequence; each phase may prompt.')
     .action(async (opts) => {
       if (opts.all) {
         for (const p of phases) await p.fn();
@@ -771,6 +1096,92 @@ async function main() {
       }
       await mainMenu();
     });
+
+  const phaseCmd = program
+    .command('phase')
+    .description('Run ONE phase by name (for scripts/agents). No prompts when options are provided. Use: vps-setup phase <name> [options]. List: prerequisites, firewall, updates, ssh, sudo, nginx, fail2ban, ufw-logging, mosh.')
+    .option('--force', 'Re-run even if this phase is already applied (default: skip when satisfied)');
+
+  phaseCmd
+    .command('prerequisites')
+    .description('Create sudo user and add SSH public key.')
+    .option('--user <name>', 'Username to create (e.g. deploy). Required in non-interactive mode.')
+    .option('--ssh-key <key>', 'SSH public key (one line), or path to .pub file (e.g. ~/.ssh/id_ed25519.pub).')
+    .option('--force', 'Re-run even if user exists and key is already present')
+    .addHelpText('after', 'Agent (no prompts): pass --user and --ssh-key. Example: vps-setup phase prerequisites --user deploy --ssh-key "$(cat ~/.ssh/id_ed25519.pub)"')
+    .action((opts) => phasePrerequisites(opts));
+
+  phaseCmd
+    .command('firewall')
+    .description('Install UFW, set rules, optionally enable.')
+    .option('--allow <ports>', 'Comma-separated TCP ports to allow (default: 22,80,443)', '22,80,443')
+    .option('--deny <ports>', 'Comma-separated ports to deny (default: 3000,8080)', '3000,8080')
+    .option('--enable', 'Enable UFW. Omit to only write rules.')
+    .option('--force', 'Re-run even if UFW is already active with allow ports')
+    .addHelpText('after', 'Agent: pass --enable to turn on firewall. Example: vps-setup phase firewall --allow 22,80,443 --enable')
+    .action((opts) => phaseFirewall(opts));
+
+  phaseCmd
+    .command('updates')
+    .description('Enable automatic security updates (apt/dnf/yum).')
+    .option('--enable', 'Enable automatic updates. Omit to skip.')
+    .option('--force', 'Re-run even if automatic updates already configured')
+    .addHelpText('after', 'Agent: pass --enable to configure. Example: vps-setup phase updates --enable')
+    .action((opts) => phaseUpdates(opts));
+
+  phaseCmd
+    .command('ssh')
+    .description('Write SSH drop-in config. Level: match (safe) or harden (key-only, AllowUsers).')
+    .option('--level <level>', 'match or harden (default: match)', 'match')
+    .option('--allow-users <list>', 'Comma-separated usernames for AllowUsers (required if level=harden)')
+    .option('--restart', 'Restart SSH after writing config (only if another session is open)')
+    .option('--force', 'Re-run even if SSH drop-in already exists')
+    .addHelpText('after', 'Agent: --level match (safe) or harden; if harden, pass --allow-users user1,user2. Optional --restart. Example: vps-setup phase ssh --level harden --allow-users deploy')
+    .action((opts) => phaseSsh(opts));
+
+  phaseCmd
+    .command('sudo')
+    .description('Comment out root NOPASSWD in 90-cloud-init-users (if present).')
+    .option('--remove-nopasswd', 'Apply change. Omit to skip.')
+    .option('--force', 'Re-run even if NOPASSWD already removed')
+    .addHelpText('after', 'Agent: pass --remove-nopasswd to comment out root NOPASSWD. Example: vps-setup phase sudo --remove-nopasswd')
+    .action((opts) => phaseSudo(opts));
+
+  phaseCmd
+    .command('nginx')
+    .description('Install Nginx + Certbot; server block for domain; optional reverse-proxy.')
+    .option('--domain <domain>', 'Primary domain (e.g. example.com). Required.')
+    .option('--extra-domains <list>', 'Comma-separated extra domains for same cert (e.g. www.example.com)')
+    .option('--backends <list>', 'Comma-separated host:port (e.g. 127.0.0.1:3000). Omit for static root.')
+    .option('--certbot', 'Run certbot for TLS (default: true)')
+    .option('--no-certbot', 'Skip certbot')
+    .option('--force', 'Re-run even if server block for this domain already exists')
+    .addHelpText('after', 'Agent: pass --domain (required). Optional: --extra-domains, --backends. Use --no-certbot to skip TLS. Example: vps-setup phase nginx --domain example.com --backends 127.0.0.1:3000')
+    .action((opts) => phaseNginx(opts));
+
+  phaseCmd
+    .command('fail2ban')
+    .description('Install and enable fail2ban (sshd jail).')
+    .option('--enable', 'Install and enable. Omit to skip.')
+    .option('--force', 'Re-run even if fail2ban is already active')
+    .addHelpText('after', 'Agent: pass --enable. Example: vps-setup phase fail2ban --enable')
+    .action((opts) => phaseFail2ban(opts));
+
+  phaseCmd
+    .command('ufw-logging')
+    .description('Set UFW logging level (off, low, medium, high, full).')
+    .option('--level <level>', 'Logging level (default: medium)', 'medium')
+    .option('--force', 'Re-run even if logging already at this level')
+    .addHelpText('after', 'Agent: pass --level. Example: vps-setup phase ufw-logging --level medium')
+    .action((opts) => phaseUfwLogging(opts));
+
+  phaseCmd
+    .command('mosh')
+    .description('Install mosh server and allow UDP 60000:61000 in UFW.')
+    .option('--enable', 'Install and open firewall. Omit to skip.')
+    .option('--force', 'Re-run even if mosh is installed and port range allowed')
+    .addHelpText('after', 'Agent: pass --enable. Example: vps-setup phase mosh --enable')
+    .action((opts) => phaseMosh(opts));
 
   program.parse();
 }
