@@ -14,6 +14,8 @@ import { select, input } from '@inquirer/prompts';
 import chalk from 'chalk';
 import ora from 'ora';
 
+const GUIDE_URL = 'https://github.com/pkukkapalli/vps-setup/blob/main/docs/guide.md';
+
 const info = (msg) => console.log(chalk.cyan('[*]'), msg);
 const ok = (msg) => console.log(chalk.green('[OK]'), msg);
 const warn = (msg) => console.log(chalk.yellow('[!]'), msg);
@@ -723,6 +725,7 @@ async function mainMenu() {
       choices: [
         ...phases.map((p) => ({ name: `${p.key.toUpperCase()}) ${p.label}`, value: p.key })),
         { name: '1) Run all phases in order', value: '1' },
+        { name: '?) Guide & troubleshooting', value: '?' },
         { name: 'q) Quit', value: 'q' },
       ],
     });
@@ -730,6 +733,11 @@ async function mainMenu() {
     if (choice === 'q') {
       console.log('Bye.');
       return;
+    }
+    if (choice === '?') {
+      console.log('\n' + chalk.cyan('Guide & troubleshooting (in-depth details for each phase):'));
+      console.log(chalk.underline(GUIDE_URL) + '\n');
+      continue;
     }
     if (choice === '1') {
       for (const p of phases) await p.fn();
@@ -747,6 +755,7 @@ async function main() {
     warn('No supported package manager detected (apt, dnf, yum, pacman, zypper). Package-install phases may fail.');
   }
   info('VPS Security Setup — interactive. Run phases in order (A then B then C ...).');
+  console.log(chalk.dim('  For in-depth details and troubleshooting: ' + GUIDE_URL + '\n'));
 
   const program = new Command();
   program.name('vps-setup').description('Interactive VPS security setup (UFW, SSH, updates, Nginx, fail2ban)');

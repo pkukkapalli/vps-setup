@@ -2,7 +2,9 @@
 
 <p align="center"><img src="logo.png" width="200" alt="vps-setup logo" /></p>
 
-Interactive CLI to set up a new VPS (firewall, automatic security updates, SSH hardening, optional Nginx/TLS and fail2ban). Plan reference: see docs or `knowledge/vps-security-replication-plan.md` if you have the full repo.
+Interactive CLI to set up a new VPS (firewall, automatic security updates, SSH hardening, optional Nginx/TLS and fail2ban).
+
+**In-depth guide & troubleshooting:** [docs/guide.md](docs/guide.md) (index) — with separate docs per phase: [A Prerequisites](docs/phase-a-prerequisites.md), [B Firewall](docs/phase-b-firewall.md), [C Updates](docs/phase-c-updates.md), [D SSH](docs/phase-d-ssh.md), [E Sudo](docs/phase-e-sudo.md), [F Nginx](docs/phase-f-nginx.md), [G Fail2ban](docs/phase-g-fail2ban.md), [H UFW logging](docs/phase-h-ufw-logging.md), [M Mosh](docs/phase-m-mosh.md). The CLI shows the guide link at startup and under **?) Guide & troubleshooting**.
 
 ## Install (Linux)
 
