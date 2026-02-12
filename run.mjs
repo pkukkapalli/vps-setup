@@ -228,9 +228,11 @@ function isPrerequisitesSatisfied(opts) {
     if (!user) return false;
     const idResult = spawnSync('id', ['--', user], { encoding: 'utf8', stdio: 'pipe' });
     if (idResult.status !== 0) return false;
-    const authKeys = `/home/${user}/.ssh/authorized_keys`;
-    const catResult = runRoot(['test', '-f', authKeys], { allowFail: true });
-    if (catResult.status !== 0) return false;
+    const getent = runRoot(['getent', 'passwd', user], { capture: true, allowFail: true });
+    const homeDir = getent.status === 0 && getent.stdout ? getent.stdout.split(':')[5] : null;
+    const authKeys = homeDir ? `${homeDir}/.ssh/authorized_keys` : `/home/${user}/.ssh/authorized_keys`;
+    const testResult = runRoot(['test', '-f', authKeys], { allowFail: true });
+    if (testResult.status !== 0) return false;
     const key = opts.sshKey ? readSshKeyFromOpt(opts.sshKey) : null;
     if (key) {
       const content = (runRoot(['cat', authKeys], { capture: true }).stdout || '');
@@ -296,7 +298,10 @@ async function phasePrerequisites(opts) {
     ok(`Created ${newuser} and added to ${sudoGroup} group.`);
   }
 
-  const sshDir = `/home/${newuser}/.ssh`;
+  // Use actual home from passwd so system users (e.g. home=/opt/deploy) work
+  const getent = runRoot(['getent', 'passwd', newuser], { capture: true });
+  const homeDir = (getent.stdout || '').split(':')[5] || `/home/${newuser}`;
+  const sshDir = `${homeDir}/.ssh`;
   runRoot(['mkdir', '-p', sshDir]);
   runRoot(['chmod', '700', sshDir]);
   runRoot(['chown', `${newuser}:${newuser}`, sshDir]);
@@ -325,21 +330,28 @@ async function phasePrerequisites(opts) {
 
   if (pubkey) {
     const authKeys = `${sshDir}/authorized_keys`;
-    // Append key using a temp file + cat >> (tee would echo to stdout)
-    if (useSudo) {
-      const tmp = join(tmpdir(), `vps-setup-key-${Date.now()}`);
-      writeFileSync(tmp, pubkey + '\n');
-      try {
-        spawnSync('sudo', ['sh', '-c', `cat "${tmp}" >> "${authKeys}"`], { stdio: 'inherit', shell: false });
-      } finally {
-        try { unlinkSync(tmp); } catch {}
-      }
+    const keyTrim = pubkey.trim();
+    const existing = runRoot(['cat', authKeys], { capture: true, allowFail: true });
+    const existingContent = existing.status === 0 ? (existing.stdout || '') : '';
+    const alreadyPresent = existingContent.split('\n').some((line) => line.trim() === keyTrim);
+    if (alreadyPresent) {
+      ok(`Key already in authorized_keys. Test with: ssh ${newuser}@<this-server-ip>`);
     } else {
-      writeFileSync(authKeys, pubkey + '\n', { flag: 'a' });
+      if (useSudo) {
+        const tmp = join(tmpdir(), `vps-setup-key-${Date.now()}`);
+        writeFileSync(tmp, keyTrim + '\n');
+        try {
+          spawnSync('sudo', ['sh', '-c', `cat "${tmp}" >> "${authKeys}"`], { stdio: 'inherit', shell: false });
+        } finally {
+          try { unlinkSync(tmp); } catch {}
+        }
+      } else {
+        writeFileSync(authKeys, keyTrim + '\n', { flag: 'a' });
+      }
+      runRoot(['chown', `${newuser}:${newuser}`, authKeys]);
+      runRoot(['chmod', '600', authKeys]);
+      ok(`Key added. Test with: ssh ${newuser}@<this-server-ip>`);
     }
-    runRoot(['chown', `${newuser}:${newuser}`, authKeys]);
-    runRoot(['chmod', '600', authKeys]);
-    ok(`Key added. Test with: ssh ${newuser}@<this-server-ip>`);
   } else {
     if (!agentMode) {
       warn(`No key entered. To create or find your key and copy it, see: ${SSH_KEY_HELP_URL}`);
@@ -419,8 +431,10 @@ async function phaseFirewall(opts) {
   }
 
   const ufwDefault = '/etc/default/ufw';
-  if (existsSync(ufwDefault)) {
-    let content = readFileSync(ufwDefault, 'utf8');
+  const ufwDefaultResult = runRoot(['test', '-f', ufwDefault], { allowFail: true });
+  if (ufwDefaultResult.status === 0) {
+    const r = runRoot(['cat', ufwDefault], { capture: true });
+    let content = r.stdout || '';
     if (!content.includes('IPV6=yes') && content.includes('IPV6=')) {
       content = content.replace(/^IPV6=.*/m, 'IPV6=yes');
       writeFileRoot(ufwDefault, content);
