@@ -1,0 +1,41 @@
+# Build Linux executables and publish to GitHub Releases on version tags (e.g. v1.0.0).
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build executables
+        run: npm run build
+
+      - name: Rename artifacts for download URLs
+        run: |
+          cd dist
+          cp vps-setup-x64 vps-setup-linux-amd64
+          cp vps-setup-arm64 vps-setup-linux-arm64
+
+      - name: Create Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/vps-setup-linux-amd64
+            dist/vps-setup-linux-arm64
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

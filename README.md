@@ -2,13 +2,31 @@
 
 Interactive CLI to set up a new VPS (firewall, automatic security updates, SSH hardening, optional Nginx/TLS and fail2ban). Plan reference: see docs or `knowledge/vps-security-replication-plan.md` if you have the full repo.
 
-## Requirements
+## Download executable (Linux)
+
+No Node.js required. Download the binary for your architecture and run:
+
+| Architecture | Download (latest release) |
+|-------------|---------------------------|
+| **Linux x86_64 (amd64)** | [vps-setup-linux-amd64](https://github.com/pkukkapalli/vps-setup/releases/latest/download/vps-setup-linux-amd64) |
+| **Linux ARM64 (aarch64)** | [vps-setup-linux-arm64](https://github.com/pkukkapalli/vps-setup/releases/latest/download/vps-setup-linux-arm64) |
+
+```bash
+# Example: amd64
+curl -fSL -o vps-setup https://github.com/pkukkapalli/vps-setup/releases/latest/download/vps-setup-linux-amd64
+chmod +x vps-setup
+./vps-setup
+```
+
+When the tool needs root it will prompt for your password (`sudo`).
+
+## Requirements (if running from source)
 
 - **Node.js 18+**
 - **Supported distros:** Debian, Ubuntu (apt); Fedora, RHEL, CentOS, Rocky, Alma (dnf/yum); Arch (pacman); OpenSUSE (zypper)
 - You may run as any user; the tool will prompt for your password when `sudo` is required
 
-## Copy to your VPS
+## Copy to your VPS (source)
 
 From your laptop (replace `user` and `your-vps-ip`):
 
