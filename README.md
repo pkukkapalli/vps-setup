@@ -1,5 +1,7 @@
 # VPS Security Setup — Interactive CLI
 
+<p align="center"><img src="logo.svg" width="120" alt="vps-setup logo" /></p>
+
 Interactive CLI to set up a new VPS (firewall, automatic security updates, SSH hardening, optional Nginx/TLS and fail2ban). Plan reference: see docs or `knowledge/vps-security-replication-plan.md` if you have the full repo.
 
 ## Install (Linux)
