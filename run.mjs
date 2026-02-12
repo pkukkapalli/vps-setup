@@ -1057,7 +1057,7 @@ async function mainMenu() {
     }
     if (choice === '?') {
       console.log('\n' + chalk.cyan('Guide & troubleshooting (in-depth details for each phase):'));
-      console.log(chalk.underline(GUIDE_URL) + '\n');
+      console.log(GUIDE_URL + '\n');
       continue;
     }
     if (choice === '1') {
@@ -1087,6 +1087,8 @@ AGENT / AUTOMATION USE (non-interactive, no prompts):
   Run a single phase by name with flags. Required and optional options vary by phase.
   Get per-phase help:  vps-setup phase <name> --help
   Phases skip if already applied; use --force to re-run.
+
+  Guide (web): ${GUIDE_URL}
 
   Phases: prerequisites | firewall | updates | ssh | sudo | nginx | fail2ban | ufw-logging | mosh
 
