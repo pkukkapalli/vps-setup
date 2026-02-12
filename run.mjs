@@ -199,13 +199,17 @@ function pkgInstall(packages) {
   else err('No supported package manager found (apt, dnf, yum, pacman, zypper).');
 }
 
-/** Ensure we can run as root: if not root, run sudo -v to prompt for password. */
+/** Ensure we can run as root: if not root, use sudo. Try non-interactive first (NOPASSWD); only prompt if needed. */
 function ensureRoot() {
   if (typeof process.geteuid === 'function' && process.geteuid() === 0) {
     useSudo = false;
     return;
   }
   useSudo = true;
+  // Try sudo -n (non-interactive) first; if it works, user has NOPASSWD or valid ticket — no password prompt
+  const noPrompt = spawnSync('sudo', ['-n', 'true'], { stdio: 'pipe', encoding: 'utf8' });
+  if (noPrompt.status === 0) return;
+  // Otherwise prompt once to establish/refresh the sudo ticket
   console.log(chalk.yellow('This tool needs root for some steps. You may be asked for your password.\n'));
   const r = spawnSync('sudo', ['-v'], { stdio: 'inherit', encoding: 'utf8' });
   if (r.status !== 0) err('sudo failed or password not entered. Run with: sudo node run.mjs');

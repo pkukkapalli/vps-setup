@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.1] - 2025-02-12
+
+### Fixed
+
+- No longer prompts for sudo password when the current user has NOPASSWD (or a valid sudo ticket): try `sudo -n true` first and only run `sudo -v` if needed.
+
 ## [1.3.0] - 2025-02-12
 
 ### Added
@@ -87,7 +93,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phases: Prerequisites (user + SSH key), Firewall (UFW), Automatic updates, SSH hardening, Sudo (cloud-init NOPASSWD), Nginx + TLS, Fail2ban, UFW logging, Mosh.
 - Linux executable build (esbuild + pkg) and GitHub Release workflow on tag `v*` (amd64 and arm64).
 
-[Unreleased]: https://github.com/pkukkapalli/vps-setup/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/pkukkapalli/vps-setup/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/pkukkapalli/vps-setup/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/pkukkapalli/vps-setup/compare/v1.2.2...v1.3.0
 [1.2.2]: https://github.com/pkukkapalli/vps-setup/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/pkukkapalli/vps-setup/compare/v1.2.0...v1.2.1
