@@ -2,9 +2,28 @@
 
 Interactive CLI to set up a new VPS (firewall, automatic security updates, SSH hardening, optional Nginx/TLS and fail2ban). Plan reference: see docs or `knowledge/vps-security-replication-plan.md` if you have the full repo.
 
-## Download executable (Linux)
+## Install (Linux)
 
-No Node.js required. Download the binary for your architecture and run:
+No Node.js required.
+
+### One-line install script
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pkukkapalli/vps-setup/main/install.sh | bash
+```
+
+This downloads the latest release binary for your architecture (amd64 or arm64) into the current directory as `vps-setup`. Run `./vps-setup`.
+
+To install into `/usr/local/bin` so you can run `vps-setup` from anywhere:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pkukkapalli/vps-setup/main/install.sh | bash -s -- --install
+```
+
+**Public script URL:**  
+[https://raw.githubusercontent.com/pkukkapalli/vps-setup/main/install.sh](https://raw.githubusercontent.com/pkukkapalli/vps-setup/main/install.sh)
+
+### Manual download
 
 | Architecture | Download (latest release) |
 |-------------|---------------------------|
