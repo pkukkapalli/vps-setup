@@ -6,6 +6,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -36,6 +39,6 @@ jobs:
           files: |
             dist/vps-setup-linux-amd64
             dist/vps-setup-linux-arm64
-          generate_release_notes: true
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
