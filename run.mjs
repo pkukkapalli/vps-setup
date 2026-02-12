@@ -24,6 +24,16 @@ function docUrl(filename) {
 const info = (msg) => console.log(chalk.cyan('[*]'), msg);
 const ok = (msg) => console.log(chalk.green('[OK]'), msg);
 const warn = (msg) => console.log(chalk.yellow('[!]'), msg);
+
+/** Shown when user has not verified SSH key login — they risk lockout if they enable firewall or harden SSH. */
+function warnUnverifiedKeyLogin() {
+  console.log(chalk.red.bold('\n!!!  YOU DID NOT VERIFY KEY LOGIN  !!!\n'));
+  console.log(chalk.red('If you run Firewall (UFW) or SSH hardening next WITHOUT testing in another terminal,'));
+  console.log(chalk.red('you can be LOCKED OUT of this server. Password login may be disabled; if your key'));
+  console.log(chalk.red('does not work, you will have no way to log in.\n'));
+  console.log(chalk.yellow.bold('Before running Phase B or D: open a NEW terminal, ssh in with your key, run sudo -v.'));
+  console.log(chalk.yellow('Only then run firewall or SSH hardening here.\n'));
+}
 const err = (msg) => {
   console.error(chalk.red('[ERROR]'), msg);
   process.exit(1);
@@ -267,8 +277,10 @@ async function phasePrerequisites(opts) {
     const createUser = await promptYn('Do you want to create a new sudo user now?', 'n');
     if (createUser !== 'y') {
       const verified = await promptYn('Have you verified key login and sudo from another terminal?', 's');
-      if (verified !== 'y') warn('Please verify key login before enabling firewall or changing SSH.');
-      info(`Manual steps: ${docUrl('phase-a-prerequisites.md')}`);
+      if (verified !== 'y') {
+        warnUnverifiedKeyLogin();
+        info(`Manual steps: ${docUrl('phase-a-prerequisites.md')}`);
+      }
       return;
     }
     newuser = (await input({ message: 'Username for new admin user', default: '' })).trim();
@@ -320,11 +332,26 @@ async function phasePrerequisites(opts) {
   });
 
     const sshKeyHints = {
-      macos: 'On your Mac: run  pbcopy < ~/.ssh/id_ed25519.pub  (or id_rsa.pub) then paste here.',
-      windows: 'On Windows: PowerShell  Get-Content $env:USERPROFILE\\.ssh\\id_ed25519.pub | Set-Clipboard  then paste. Or open the .pub file in Notepad and copy the line.',
-      linux: 'On your machine: run  cat ~/.ssh/id_ed25519.pub  (or id_rsa.pub), copy the full line and paste here.',
+      macos: [
+        'Copy to clipboard:  pbcopy < ~/.ssh/id_ed25519.pub   (or id_rsa.pub)',
+        'Then paste here (Cmd+V).',
+        'Key file missing? Generate:  ssh-keygen -t ed25519 -C you@example.com -f ~/.ssh/id_ed25519 -N ""',
+      ],
+      windows: [
+        'PowerShell:  Get-Content $env:USERPROFILE\\.ssh\\id_ed25519.pub | Set-Clipboard   then paste (Ctrl+V).',
+        'Or open in Notepad:  notepad %USERPROFILE%\\.ssh\\id_ed25519.pub   and copy the full line.',
+        'Key file missing? In PowerShell:  ssh-keygen -t ed25519 -C you@example.com -f $env:USERPROFILE\\.ssh\\id_ed25519 -N ""',
+      ],
+      linux: [
+        'Show key:  cat ~/.ssh/id_ed25519.pub   (or id_rsa.pub). Copy the full line and paste here.',
+        'With xclip:  xclip -selection clipboard < ~/.ssh/id_ed25519.pub   then paste.',
+        'Key file missing? Generate:  ssh-keygen -t ed25519 -C you@example.com -f ~/.ssh/id_ed25519 -N ""',
+      ],
     };
-    console.log(chalk.cyan('\n  ' + sshKeyHints[hostOs]) + '\n');
+    const lines = sshKeyHints[hostOs];
+    console.log(chalk.cyan('\n  SSH key — copy from your laptop and paste below:'));
+    lines.forEach((line) => console.log(chalk.cyan('  ' + line)));
+    console.log('');
     pubkey = (await input({ message: 'Paste your SSH public key (one line), then Enter', default: '' })).trim();
   }
 
@@ -354,14 +381,53 @@ async function phasePrerequisites(opts) {
     }
   } else {
     if (!agentMode) {
-      warn(`No key entered. To create or find your key and copy it, see: ${SSH_KEY_HELP_URL}`);
-      warn(`Or add it manually later to ${sshDir}/authorized_keys`);
+      warn('No key entered.');
+      info('If the key file is missing, on your laptop run:  ssh-keygen -t ed25519 -C you@example.com -f ~/.ssh/id_ed25519 -N ""  then copy the .pub file and run this phase again.');
+      info(`Full copy-paste and generate steps: ${SSH_KEY_HELP_URL}`);
+      warn(`Or add the key manually later to ${sshDir}/authorized_keys`);
+    }
+  }
+
+  // Sudo: NOPASSWD or set a password for the new user
+  const sudoChoice = agentMode
+    ? (opts.sudoNopasswd === true ? 'nopasswd' : null)
+    : (await select({
+        message: `Sudo for ${newuser}: use NOPASSWD (no password) or set a password now?`,
+        default: 'nopasswd',
+        choices: [
+          { name: 'NOPASSWD — no password needed for sudo (common for automation)', value: 'nopasswd' },
+          { name: 'Set a password — I will type it now; sudo will prompt for it', value: 'password' },
+        ],
+      }));
+
+  if (sudoChoice === 'nopasswd') {
+    const sudoersSafe = newuser.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const sudoersPath = `/etc/sudoers.d/99-vps-setup-${sudoersSafe}`;
+    const content = `${newuser} ALL=(ALL) NOPASSWD:ALL\n`;
+    writeFileRoot(sudoersPath, content);
+    runRoot(['chmod', '440', sudoersPath]);
+    const check = runRoot(['visudo', '-c', '-f', sudoersPath], { allowFail: true });
+    if (check.status !== 0) {
+      runRoot(['rm', '-f', sudoersPath]);
+      err(`Sudoers file failed validation. Removed ${sudoersPath}. Check username.`);
+    }
+    ok(`${newuser} can run sudo without a password (NOPASSWD).`);
+  } else if (sudoChoice === 'password') {
+    console.log(chalk.cyan(`\n  Enter a password for ${newuser} (sudo will ask for it when needed):\n`));
+    const passwdResult = spawnSync(useSudo ? 'sudo' : 'passwd', useSudo ? ['passwd', newuser] : [newuser], {
+      stdio: 'inherit',
+      encoding: 'utf8',
+    });
+    if (passwdResult.status !== 0) {
+      warn('Setting password failed or was cancelled. You can run: sudo passwd ' + newuser + ' later.');
+    } else {
+      ok(`Password set for ${newuser}. They will type it when sudo prompts.`);
     }
   }
 
   if (!agentMode) {
     const verified = await promptYn('Have you verified key login and sudo from another terminal?', 's');
-    if (verified !== 'y') warn('Please verify key login before enabling firewall or changing SSH.');
+    if (verified !== 'y') warnUnverifiedKeyLogin();
   }
 }
 
@@ -558,7 +624,9 @@ async function phaseSsh(opts) {
       ],
     });
     if (verified !== 'y') {
-      warn('SSH hardening skipped.');
+      console.log(chalk.red.bold('\n!!!  SSH HARDENING SKIPPED — YOU DID NOT VERIFY KEY LOGIN  !!!\n'));
+      console.log(chalk.red('Do NOT enable firewall or change SSH until you have logged in from another'));
+      console.log(chalk.red('terminal with your key only and confirmed sudo works. Otherwise you risk lockout.\n'));
       info(`Manual config and lockout recovery: ${docUrl('phase-d-ssh.md')}`);
       return;
     }
@@ -1123,8 +1191,9 @@ AGENT / AUTOMATION USE (non-interactive, no prompts):
     .description('Create sudo user and add SSH public key.')
     .option('--user <name>', 'Username to create (e.g. deploy). Required in non-interactive mode.')
     .option('--ssh-key <key>', 'SSH public key (one line), or path to .pub file (e.g. ~/.ssh/id_ed25519.pub).')
+    .option('--sudo-nopasswd', 'Give the new user NOPASSWD for sudo (no password). Omit to leave default.')
     .option('--force', 'Re-run even if user exists and key is already present')
-    .addHelpText('after', 'Agent (no prompts): pass --user and --ssh-key. Example: vps-setup phase prerequisites --user deploy --ssh-key "$(cat ~/.ssh/id_ed25519.pub)"')
+    .addHelpText('after', 'Agent (no prompts): pass --user and --ssh-key. Optional: --sudo-nopasswd. Example: vps-setup phase prerequisites --user deploy --ssh-key "$(cat ~/.ssh/id_ed25519.pub)" --sudo-nopasswd')
     .action((opts) => phasePrerequisites(opts));
 
   phaseCmd
