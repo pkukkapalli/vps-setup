@@ -83,10 +83,11 @@ Uses **commander**, **@inquirer/prompts**, **chalk**, **ora**. See [docs/node-cl
 | C | Automatic security updates (apt/dnf; skipped on unsupported distros) |
 | D | SSH hardening — drop-in config (match or harden with key-only, AllowUsers) |
 | E | Sudo — comment out root NOPASSWD in cloud-init |
-| F | Nginx + Certbot (optional) |
+| F | Nginx + custom domain + TLS (optional reverse proxy / load balancing to backends) |
 | G | Fail2ban (optional) |
 | H | UFW logging medium |
-| 1 | Run all (A–E then prompt F/G/H) |
+| M | Mosh (mobile shell) — install server, allow UDP 60000:61000 |
+| 1 | Run all (A–E then prompt F/G/H/M) |
 | q | Quit |
 
 Run in order: A → B → C → D → E, then F/G/H if you want. Ensure key-based login works (Phase A) before enabling UFW or changing SSH (B, D).

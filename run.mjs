@@ -25,20 +25,6 @@ const err = (msg) => {
 /** True if we need to prefix privileged commands with sudo (running as non-root). */
 let useSudo = false;
 
-function run(cmd, options = {}) {
-  const { capture = false, allowFail = false } = options;
-  const result = spawnSync(cmd[0], cmd.slice(1), {
-    stdio: capture ? 'pipe' : 'inherit',
-    encoding: 'utf8',
-    shell: false,
-  });
-  if (result.status !== 0 && !allowFail) {
-    const msg = (result.stderr || result.stdout || '').trim() || `Command failed: ${cmd.join(' ')}`;
-    throw new Error(msg);
-  }
-  return result;
-}
-
 /** Run a command with root privileges (direct if root, else via sudo). */
 function runRoot(cmd, options = {}) {
   const { capture = false, allowFail = false, stdin: stdinContent } = options;
@@ -100,8 +86,10 @@ function readOsRelease() {
   return out;
 }
 
-/** Detect distro and package manager. Returns { id, pkgManager, sudoGroup }. */
+/** Detect distro and package manager. Returns { id, pkgManager, sudoGroup }. Cached after first call. */
+let _distroCache = null;
 function getDistro() {
+  if (_distroCache) return _distroCache;
   const os = readOsRelease();
   const id = (os.ID || '').toLowerCase();
   const like = (os.ID_LIKE || '').toLowerCase();
@@ -121,7 +109,8 @@ function getDistro() {
     try { execSync('which zypper', { stdio: 'pipe' }); pkgManager = 'zypper'; } catch {}
     sudoGroup = 'wheel';
   }
-  return { id, pkgManager, sudoGroup };
+  _distroCache = { id, pkgManager, sudoGroup };
+  return _distroCache;
 }
 
 /** Package names per phase per pkgManager. */
@@ -131,30 +120,35 @@ const PACKAGES = {
     updates: ['unattended-upgrades', 'apt-listchanges'],
     nginx: ['nginx', 'certbot', 'python3-certbot-nginx'],
     fail2ban: ['fail2ban'],
+    mosh: ['mosh'],
   },
   dnf: {
     ufw: ['ufw'],
     updates: ['dnf-automatic'],
     nginx: ['nginx', 'certbot', 'python3-certbot-nginx'],
     fail2ban: ['fail2ban'],
+    mosh: ['mosh'],
   },
   yum: {
     ufw: ['ufw'],
-    updates: ['dnf-automatic'],
+    updates: ['yum-cron'],
     nginx: ['nginx', 'certbot', 'python3-certbot-nginx'],
     fail2ban: ['fail2ban'],
+    mosh: ['mosh'],
   },
   pacman: {
     ufw: ['ufw'],
     updates: [],
-    nginx: ['nginx', 'certbot'],
+    nginx: ['nginx', 'certbot', 'certbot-nginx'],
     fail2ban: ['fail2ban'],
+    mosh: ['mosh'],
   },
   zypper: {
     ufw: ['ufw'],
     updates: [],
-    nginx: ['nginx', 'certbot'],
+    nginx: ['nginx', 'certbot', 'python3-certbot-nginx'],
     fail2ban: ['fail2ban'],
+    mosh: ['mosh'],
   },
 };
 
@@ -247,7 +241,18 @@ async function phasePrerequisites() {
   const pubkey = (await input({ message: 'Paste your SSH public key (one line), then Enter', default: '' })).trim();
   if (pubkey) {
     const authKeys = `${sshDir}/authorized_keys`;
-    runRoot(['tee', '-a', authKeys], { stdin: pubkey + '\n' });
+    // Append key using a temp file + cat >> (tee would echo to stdout)
+    if (useSudo) {
+      const tmp = join(tmpdir(), `vps-setup-key-${Date.now()}`);
+      writeFileSync(tmp, pubkey + '\n');
+      try {
+        spawnSync('sudo', ['sh', '-c', `cat "${tmp}" >> "${authKeys}"`], { stdio: 'inherit', shell: false });
+      } finally {
+        try { unlinkSync(tmp); } catch {}
+      }
+    } else {
+      writeFileSync(authKeys, pubkey + '\n', { flag: 'a' });
+    }
     runRoot(['chown', `${newuser}:${newuser}`, authKeys]);
     runRoot(['chmod', '600', authKeys]);
     ok(`Key added. Test with: ssh ${newuser}@<this-server-ip>`);
@@ -339,8 +344,10 @@ async function phaseUpdates() {
       if (existsSync(fifty) && readFileSync(fifty, 'utf8').includes('updates";')) {
         warn('50unattended-upgrades may include -updates. Check that file.');
       }
-    } else if (pkgManager === 'dnf' || pkgManager === 'yum') {
+    } else if (pkgManager === 'dnf') {
       runRoot(['systemctl', 'enable', '--now', 'dnf-automatic-install.timer']);
+    } else if (pkgManager === 'yum') {
+      runRoot(['systemctl', 'enable', '--now', 'yum-cron']);
     }
     spinner.succeed('Automatic updates configured.');
   } catch (e) {
@@ -456,7 +463,13 @@ async function phaseSudo() {
     info('No cloud-init sudoers file found. Nothing to change.');
     return;
   }
-  const content = readFileSync(cloudSudo, 'utf8');
+  // sudoers files are typically mode 0440 — must read as root
+  const catResult = runRoot(['cat', cloudSudo], { capture: true, allowFail: true });
+  if (catResult.status !== 0) {
+    warn(`Cannot read ${cloudSudo}. Skipping.`);
+    return;
+  }
+  const content = catResult.stdout || '';
   if (!content.includes('NOPASSWD')) {
     info('No root NOPASSWD in file. Nothing to change.');
     return;
@@ -470,10 +483,37 @@ async function phaseSudo() {
   ok('Commented out. Restored from ' + cloudSudo + '.bak if needed.');
 }
 
-// --- Phase F: Nginx ---
+// --- Phase F: Nginx (custom domain + optional load balancing) ---
+
+/** Validate a domain name (basic: letters, digits, hyphens, dots; no spaces or special chars). */
+function isValidDomain(d) {
+  return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(d) && d.length <= 253;
+}
+
+function isValidPort(p) {
+  const n = Number(p);
+  return Number.isInteger(n) && n >= 1 && n <= 65535;
+}
+
+function parseBackends(raw) {
+  const parts = raw.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+  const out = [];
+  for (const s of parts) {
+    if (s.startsWith(':')) {
+      const port = s.slice(1);
+      if (isValidPort(port)) out.push(`127.0.0.1:${port}`);
+    } else {
+      const m = s.match(/^([\w.-]+):(\d+)$/);
+      if (m && isValidPort(m[2])) out.push(s);
+    }
+  }
+  return out;
+}
+
 async function phaseNginx() {
-  console.log('\n' + chalk.bold('========== Phase F: Nginx + TLS =========='));
-  console.log('Will: install nginx + certbot, obtain Let\'s Encrypt cert.\n');
+  console.log('\n' + chalk.bold('========== Phase F: Nginx + custom domain + TLS =========='));
+  console.log('Will: install Nginx + Certbot, set up a server block for your domain,');
+  console.log('      optionally reverse-proxy / load-balance to backend servers, then obtain Let\'s Encrypt cert.\n');
 
   if ((await promptYn('Install Nginx and Certbot?', 'n')) !== 'y') return;
 
@@ -481,24 +521,120 @@ async function phaseNginx() {
   const nginxPkgs = (PACKAGES[pkgManager] && PACKAGES[pkgManager].nginx) || ['nginx', 'certbot'];
   pkgUpdate();
   pkgInstall(nginxPkgs);
-  const domains = (await input({
-    message: 'Domain name(s) for TLS, comma-separated (e.g. example.com,www.example.com)',
+
+  const domainInput = (await input({
+    message: 'Primary domain (e.g. example.com)',
     default: '',
   })).trim();
-
-  if (!domains) {
+  if (!domainInput) {
     warn('No domain. Run later: certbot --nginx -d yourdomain.com');
     return;
   }
+  if (!isValidDomain(domainInput)) {
+    warn(`"${domainInput}" doesn't look like a valid domain. Skipping Nginx config.`);
+    return;
+  }
 
-  const parts = domains.split(',').map((d) => d.trim()).filter(Boolean).flatMap((d) => ['-d', d]);
+  const extraDomains = (await input({
+    message: 'Extra domains for same cert, comma-separated (e.g. www.example.com), or Enter to skip',
+    default: '',
+  })).trim();
+  const extraList = extraDomains.split(',').map((d) => d.trim()).filter(Boolean);
+  const invalidExtras = extraList.filter((d) => !isValidDomain(d));
+  if (invalidExtras.length > 0) {
+    warn(`Ignoring invalid domain(s): ${invalidExtras.join(', ')}`);
+  }
+  const domainList = [domainInput, ...extraList.filter(isValidDomain)];
+  const primaryDomain = domainList[0];
+  const serverNames = domainList.join(' ');
+
+  const useProxy = await promptYn('Reverse-proxy / load balance to backend servers on this VPS?', 'n');
+  let backends = [];
+  if (useProxy === 'y') {
+    const backendInput = (await input({
+      message: 'Backend addresses (host:port), space or comma separated (e.g. 127.0.0.1:3000 127.0.0.1:3001 or :8080 for localhost)',
+      default: '127.0.0.1:3000',
+    })).trim();
+    backends = parseBackends(backendInput);
+    if (backends.length === 0) {
+      warn('No valid backends. Using simple placeholder server block.');
+    }
+  }
+
+  runRoot(['systemctl', 'enable', 'nginx'], { allowFail: true });
+  runRoot(['systemctl', 'start', 'nginx'], { allowFail: true });
+
+  const confDir = '/etc/nginx/conf.d';
+  runRoot(['mkdir', '-p', confDir]);
+  const safeName = primaryDomain.replace(/[^a-z0-9.-]/gi, '_');
+  const confPath = `${confDir}/vps-setup-${safeName}.conf`;
+
+  let serverBlock;
+  if (backends.length > 0) {
+    const upstreamName = `backend_${safeName.replace(/\./g, '_')}`;
+    const servers = backends.map((b) => `    server ${b};`).join('\n');
+    serverBlock = `
+# Upstream: load balancing (round-robin) across backends
+upstream ${upstreamName} {
+${servers}
+}
+
+server {
+    listen 80;
+    server_name ${serverNames};
+    location / {
+        proxy_pass http://${upstreamName};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+    }
+}
+`;
+  } else {
+    serverBlock = `
+server {
+    listen 80;
+    server_name ${serverNames};
+    root /var/www/html;
+    index index.html;
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+`;
+  }
+
+  const configContent = `# Generated by vps-setup for ${primaryDomain}
+${serverBlock.trim()}
+`;
+
+  writeFileRoot(confPath, configContent);
+  ok(`Wrote ${confPath}`);
+
+  const testResult = runRoot(['nginx', '-t'], { capture: true, allowFail: true });
+  if (testResult.status !== 0) {
+    warn(`Nginx config test failed: ${(testResult.stderr || testResult.stdout || '').trim()}`);
+    warn(`Fix the config at ${confPath} and run: sudo nginx -t && sudo systemctl reload nginx`);
+    return;
+  }
+  runRoot(['systemctl', 'reload', 'nginx']);
+  ok('Nginx reloaded.');
+
+  const certDomains = domainList.flatMap((d) => ['-d', d]);
   const result = runRoot(
-    ['certbot', '--nginx', '--non-interactive', '--agree-tos', '--register-unsafely-without-email', ...parts],
+    ['certbot', '--nginx', '--non-interactive', '--agree-tos', '--register-unsafely-without-email', ...certDomains],
     { allowFail: true }
   );
-  if (result.status === 0) ok('Certbot succeeded.');
-  else warn('Certbot failed (e.g. DNS not pointing here). Run manually: sudo certbot --nginx -d <domain>');
-  console.log('Add security headers to your HTTPS server block (see plan doc Phase F4).');
+  if (result.status === 0) {
+    ok('TLS certificate obtained.');
+    if (backends.length > 0) info(`HTTPS traffic to ${primaryDomain} is load-balanced across ${backends.length} backend(s).`);
+  } else {
+    warn('Certbot failed (e.g. DNS not pointing here). Run manually: sudo certbot --nginx -d ' + primaryDomain);
+  }
+  console.log('You can add security headers in the server block (e.g. add_header X-Frame-Options SAMEORIGIN;).');
 }
 
 // --- Phase G: Fail2ban ---
@@ -537,15 +673,47 @@ async function phaseUfwLogging() {
   }
 }
 
+// --- Phase M: Mosh ---
+async function phaseMosh() {
+  console.log('\n' + chalk.bold('========== Phase M: Mosh (mobile shell) =========='));
+  console.log('Will: install mosh server, allow UDP 60000:61000 in UFW (mosh port range).\n');
+  console.log('Connect from your laptop with: mosh user@<server-ip>\n');
+
+  if ((await promptYn('Install Mosh and open firewall?', 'y')) !== 'y') return;
+
+  const { pkgManager } = getDistro();
+  const moshPkgs = (PACKAGES[pkgManager] && PACKAGES[pkgManager].mosh) || ['mosh'];
+  const spinner = ora('Installing mosh...').start();
+  try {
+    pkgUpdate();
+    pkgInstall(moshPkgs);
+    spinner.succeed('Mosh installed.');
+  } catch (e) {
+    spinner.fail('Failed.');
+    throw e;
+  }
+
+  const ufwStatus = runRoot(['ufw', 'status'], { capture: true, allowFail: true });
+  const ufwActive = (ufwStatus.stdout || '').toLowerCase().includes('status: active');
+  if (ufwActive) {
+    runRoot(['ufw', 'allow', '60000:61000/udp']);
+    ok('UFW: allowed UDP 60000:61000 (mosh).');
+  } else {
+    warn('UFW is not active. After enabling UFW, run: sudo ufw allow 60000:61000/udp');
+  }
+  ok('Connect with: mosh <user>@<this-server-ip>');
+}
+
 const phases = [
   { key: 'a', label: 'Prerequisites (user + SSH key)', fn: phasePrerequisites },
   { key: 'b', label: 'Firewall (UFW)', fn: phaseFirewall },
   { key: 'c', label: 'Automatic security updates', fn: phaseUpdates },
   { key: 'd', label: 'SSH hardening', fn: phaseSsh },
   { key: 'e', label: 'Sudo (remove root NOPASSWD)', fn: phaseSudo },
-  { key: 'f', label: 'Nginx + TLS (optional)', fn: phaseNginx },
+  { key: 'f', label: 'Nginx + custom domain + TLS + load balancing (optional)', fn: phaseNginx },
   { key: 'g', label: 'Fail2ban (optional)', fn: phaseFail2ban },
   { key: 'h', label: 'UFW logging medium', fn: phaseUfwLogging },
+  { key: 'm', label: 'Mosh (mobile shell)', fn: phaseMosh },
 ];
 
 async function mainMenu() {
@@ -554,7 +722,7 @@ async function mainMenu() {
       message: 'VPS Security Setup — choose phase',
       choices: [
         ...phases.map((p) => ({ name: `${p.key.toUpperCase()}) ${p.label}`, value: p.key })),
-        { name: '1) Run all (A–E then prompt F/G/H)', value: '1' },
+        { name: '1) Run all phases in order', value: '1' },
         { name: 'q) Quit', value: 'q' },
       ],
     });
